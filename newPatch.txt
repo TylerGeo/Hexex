@@ -1,0 +1,255 @@
+diff --git a/Views/Game/HexBoardView.swift b/Views/Game/HexBoardView.swift
+index 4bdfe9b..fa46a15 100644
+--- a/Views/Game/HexBoardView.swift
++++ b/Views/Game/HexBoardView.swift
+@@ -3,62 +3,125 @@ import SwiftUI
+ struct HexBoardView: View {
+     @Environment(GameViewModel.self) var vm
+
++    // Width of the invisible frame each label is laid out in. Labels with short
++    // patterns leave slack inside the frame; the slack is consumed by Spacer so
++    // the label always hugs one edge.
++    private static let labelFrameWidth: CGFloat = 200
++
++    // Budget for label margins (less than labelFrameWidth — long patterns may
++    // overflow their margin allocation but never overlap adjacent labels,
++    // because adjacent anchors are >1 hex-width apart along the perpendicular
++    // direction).
++    private static let labelMarginBudget: CGFloat = 130
++
+     var body: some View {
+         GeometryReader { geo in
+             let hexSize = computeHexSize(in: geo.size)
+             let boardSize = HexGrid.boardSize(hexSize: hexSize)
++            let m = margins
++            let fontSize = clueFontSize(for: hexSize)
+
+             ZStack {
+-                // All hex cells
+                 ForEach(allIndices(), id: \.self) { index in
+                     HexCellView(index: index, hexSize: hexSize)
+                         .position(HexGrid.cellCenter(at: index, hexSize: hexSize))
+                 }
+
+-                // Clue labels
+                 ForEach(clueDescriptors(hexSize: hexSize)) { clue in
+-                    RegexClueLabel(
+-                        pattern: clue.pattern,
+-                        state: clue.state,
+-                        isActive: clue.isActive
+-                    )
+-                    .position(clue.anchorPoint)
+-                    .rotationEffect(.degrees(clue.rotationDegrees))
+-                    .onTapGesture {
+-                        vm.selectClue(axis: clue.axis, lineIndex: clue.lineIndex)
+-                    }
++                    clueLabel(for: clue, fontSize: fontSize)
+                 }
+             }
+             .frame(width: boardSize.width, height: boardSize.height)
+-            .position(x: geo.size.width / 2, y: geo.size.height / 2)
++            // Center the board within the area between the (asymmetric) margins
++            // rather than centring it in the raw geometry — the left and bottom
++            // need a lot more space than the right.
++            .position(
++                x: (m.left + (geo.size.width - m.right)) / 2,
++                y: (m.top + (geo.size.height - m.bottom)) / 2
++            )
++        }
++    }
++
++    // MARK: - Label rendering
++
++    /// Lays the label out so its *inner* edge (the edge nearest the board) sits
++    /// exactly at `clue.anchorPoint`, and the label extends outward along the
++    /// rotated axis. Horizontal labels anchor on their trailing (right) edge;
++    /// diagonal labels anchor on their leading (left) edge and rotate about it,
++    /// so the text reads naturally along the clue line.
++    @ViewBuilder
++    private func clueLabel(for clue: ClueDescriptor, fontSize: CGFloat) -> some View {
++        let W = Self.labelFrameWidth
++        let anchorEdge: UnitPoint = (clue.axis == .horizontal) ? .trailing : .leading
++        let label = RegexClueLabel(
++            pattern: clue.pattern,
++            state: clue.state,
++            isActive: clue.isActive,
++            fontSize: fontSize
++        )
++
++        Group {
++            if anchorEdge == .leading {
++                HStack(spacing: 0) {
++                    label
++                    Spacer(minLength: 0)
++                }
++            } else {
++                HStack(spacing: 0) {
++                    Spacer(minLength: 0)
++                    label
++                }
++            }
++        }
++        .frame(width: W, alignment: anchorEdge == .leading ? .leading : .trailing)
++        .rotationEffect(.degrees(clue.rotationDegrees), anchor: anchorEdge)
++        // .position centres the frame; offset so the anchor edge lands on
++        // clue.anchorPoint. The rotation pivots around that same edge.
++        .position(
++            x: clue.anchorPoint.x + (anchorEdge == .leading ? +W / 2 : -W / 2),
++            y: clue.anchorPoint.y
++        )
++        .contentShape(Rectangle())
++        .onTapGesture {
++            vm.selectClue(axis: clue.axis, lineIndex: clue.lineIndex)
+         }
+     }
+
+-    // MARK: - Hex Size Calculation
++    // MARK: - Hex size & margins
+
+-    /// Computes a hex size that lets the board + clue labels fit in the available space.
+-    /// Labels need roughly 2.8 * hexSize of extra margin on each side.
+-    private func computeHexSize(in size: CGSize) -> CGFloat {
+-        // Reserve fixed margins for labels instead of scaling them with hexSize.
+-        // Horizontal labels need ~110pt on the left.
+-        // Diagonal labels need ~70pt on top and right.
+-        let leftMargin:   CGFloat = 110
+-        let topMargin:    CGFloat = 70
+-        let rightMargin:  CGFloat = 70
+-        let bottomMargin: CGFloat = 40
++    private struct Margins {
++        let left: CGFloat
++        let top: CGFloat
++        let right: CGFloat
++        let bottom: CGFloat
++    }
+
+-        let availW = size.width  - leftMargin - rightMargin
+-        let availH = size.height - topMargin  - bottomMargin
++    private var margins: Margins {
++        let m = Self.labelMarginBudget
++        let sin60: CGFloat = CGFloat(3.0.squareRoot()) / 2.0 // ≈ 0.866
++        return Margins(
++            left:   m + 8,          // horizontal labels extend left
++            top:    m * sin60 + 8,  // diagLeft labels extend up-right (up component)
++            right:  m * 0.5 + 8,    // diagLeft labels extend up-right (right component)
++            bottom: m * sin60 + 8   // diagRight labels extend down-right (down component)
++        )
++    }
+
++    private func computeHexSize(in size: CGSize) -> CGFloat {
++        let m = margins
++        let availW = size.width  - m.left - m.right
++        let availH = size.height - m.top  - m.bottom
+         let W = CGFloat(3).squareRoot()
+-        // Board cell area: width = 5*W*s, height = (nRows-1)*1.5*s + 2*s
+         let byWidth  = availW / (CGFloat(HexGrid.rowSizes.max() ?? 5) * W)
+         let byHeight = availH / (CGFloat(HexGrid.rowSizes.count - 1) * 1.5 + 2.0)
++        return max(18, min(52, min(byWidth, byHeight)))
++    }
+
+-        return max(20, min(52, min(byWidth, byHeight)))
++    private func clueFontSize(for hexSize: CGFloat) -> CGFloat {
++        max(10, min(14, hexSize * 0.42))
+     }
+
+-    // MARK: - Index Helpers
++    // MARK: - Index helpers
+
+     private func allIndices() -> [GridIndex] {
+         HexGrid.rowSizes.enumerated().flatMap { (row, count) in
+@@ -66,18 +129,30 @@ struct HexBoardView: View {
+         }
+     }
+
+-    // MARK: - Clue Descriptors
+-
++    // MARK: - Clue descriptors
++    //
++    // Layout convention (pointy-top hexes, y+ is down on screen):
++    //   • Horizontal:  anchor at LEFT edge of first cell, label extends left,    rotation 0°.
++    //   • DiagRight:   anchor at LOWER-RIGHT edge of last cell (bottom-right end of
++    //                  the line), label extends down-right at +60°.
++    //   • DiagLeft:    anchor at UPPER-RIGHT edge of top cell (line.last), label
++    //                  extends up-right at −60°.
++    //
++    // For diagonals, the rotation angle is chosen so the label's leading edge stays
++    // pinned to the anchor and the body unrolls along the outward unit vector
++    // (cos θ, sin θ) — which exactly equals the rotation in screen coordinates.
+     private func clueDescriptors(hexSize: CGFloat) -> [ClueDescriptor] {
+         var result: [ClueDescriptor] = []
+
+-        // Horizontal clues (5) — labels sit to the left of each row
++        let sin60: CGFloat = CGFloat(3.0.squareRoot()) / 2.0
++        let edgeGap = hexSize * 1.05
++
++        // Horizontal — label to the left of each row
+         for i in 0..<5 {
+             let line = HexGrid.horizontalLines[i]
+             guard let firstIdx = line.first else { continue }
+-            let firstCenter = HexGrid.cellCenter(at: firstIdx, hexSize: hexSize)
+-            // Place label to the left
+-            let anchor = CGPoint(x: firstCenter.x - hexSize * 1.2, y: firstCenter.y)
++            let c = HexGrid.cellCenter(at: firstIdx, hexSize: hexSize)
++            let anchor = CGPoint(x: c.x - edgeGap, y: c.y)
+             result.append(ClueDescriptor(
+                 id: "h_\(i)",
+                 pattern: vm.puzzle.horizontal[i],
+@@ -90,16 +165,12 @@ struct HexBoardView: View {
+             ))
+         }
+
+-        // DiagRight clues (5) — labels sit past the bottom-right end of each diagonal
+-        // The diagonal direction goes right and down at 60° from horizontal.
++        // DiagRight — label past the bottom-right end of each diagonal
+         for i in 0..<5 {
+             let line = HexGrid.diagRightLines[i]
+             guard let lastIdx = line.last else { continue }
+-            let lastCenter = HexGrid.cellCenter(at: lastIdx, hexSize: hexSize)
+-            let angleRad = 60.0 * Double.pi / 180.0
+-            let dx = CGFloat(cos(angleRad)) * hexSize * 1.2
+-            let dy = CGFloat(sin(angleRad)) * hexSize * 1.2
+-            let anchor = CGPoint(x: lastCenter.x + dx, y: lastCenter.y + dy)
++            let c = HexGrid.cellCenter(at: lastIdx, hexSize: hexSize)
++            let anchor = CGPoint(x: c.x + 0.5 * edgeGap, y: c.y + sin60 * edgeGap)
+             result.append(ClueDescriptor(
+                 id: "dr_\(i)",
+                 pattern: vm.puzzle.diagRight[i],
+@@ -112,17 +183,13 @@ struct HexBoardView: View {
+             ))
+         }
+
+-        // DiagLeft clues (5) — stored bottom→top, label sits above the top cell (last in array)
+-        // These diagonals go from lower-left to upper-right; the "top" cell is last in the array.
++        // DiagLeft — label past the top (upper-right) end of each diagonal
++        // (lines are stored bottom→top, so line.last is the visual top).
+         for i in 0..<5 {
+             let line = HexGrid.diagLeftLines[i]
+             guard let topIdx = line.last else { continue }
+-            let topCenter = HexGrid.cellCenter(at: topIdx, hexSize: hexSize)
+-            // Upper-right direction: -60° from horizontal
+-            let angleRad = -60.0 * Double.pi / 180.0
+-            let dx = CGFloat(cos(angleRad)) * hexSize * 1.2
+-            let dy = CGFloat(sin(angleRad)) * hexSize * 1.2
+-            let anchor = CGPoint(x: topCenter.x + dx, y: topCenter.y + dy)
++            let c = HexGrid.cellCenter(at: topIdx, hexSize: hexSize)
++            let anchor = CGPoint(x: c.x + 0.5 * edgeGap, y: c.y - sin60 * edgeGap)
+             result.append(ClueDescriptor(
+                 id: "dl_\(i)",
+                 pattern: vm.puzzle.diagLeft[i],
+diff --git a/Views/Game/RegexClueLabel.swift b/Views/Game/RegexClueLabel.swift
+index 7a91191..d995136 100644
+--- a/Views/Game/RegexClueLabel.swift
++++ b/Views/Game/RegexClueLabel.swift
+@@ -4,10 +4,11 @@ struct RegexClueLabel: View {
+     let pattern: String
+     let state: ClueState
+     let isActive: Bool
++    var fontSize: CGFloat = 14
+
+     var body: some View {
+         Text(pattern)
+-            .font(.custom("JetBrainsMono-Regular", size: 14)
++            .font(.custom("JetBrainsMono-Regular", size: fontSize)
+                 .weight(isActive ? .bold : .regular))
+             .foregroundColor(textColor)
+             .underline(isActive)

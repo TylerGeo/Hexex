@@ -15,11 +15,16 @@ struct GameView: View {
                 GameStatusBar()
                     .environment(vm)
 
-                Spacer()
+                Spacer(minLength: 0)
 
-                GeometryReader { geo in
-                    HexBoardView()
-                        .environment(vm)
+                if vm.loadingPhase == .ready {
+                    GeometryReader { _ in
+                        HexBoardView()
+                            .environment(vm)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                } else {
+                    LoadingPlaceholder(difficulty: vm.difficulty)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
 
@@ -27,14 +32,17 @@ struct GameView: View {
 
                 HexKeyboardView()
                     .environment(vm)
-                    .frame(height: 180)
+                    .frame(height: (vm.puzzle?.alphabet.count ?? 0) > 6 ? 124 : 70)
+                    .opacity(vm.loadingPhase == .ready ? 1 : 0)
+                    .disabled(vm.loadingPhase != .ready)
             }
         }
         .sheet(isPresented: $vm.showResults) {
             ResultsView()
                 .environment(vm)
         }
-        .onAppear {
+        .task {
+            await vm.start(context: modelContext)
             vm.startTimer()
         }
         .onDisappear {
@@ -44,13 +52,40 @@ struct GameView: View {
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
             case .active:
-                if !vm.isComplete { vm.startTimer() }
+                if !vm.isComplete && vm.loadingPhase == .ready { vm.startTimer() }
             case .inactive, .background:
                 vm.stopTimer()
                 vm.saveProgress(context: modelContext)
             @unknown default:
                 break
             }
+        }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    let context = modelContext
+                    Task { await vm.newPuzzle(context: context) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(vm.loadingPhase != .ready)
+            }
+        }
+        .navigationTitle(vm.difficulty.displayName)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct LoadingPlaceholder: View {
+    let difficulty: Difficulty
+
+    var body: some View {
+        VStack(spacing: 16) {
+            ProgressView()
+                .scaleEffect(1.4)
+            Text("Generating \(difficulty.displayName.lowercased()) puzzle…")
+                .font(.system(size: 14, weight: .regular, design: .rounded))
+                .foregroundColor(.secondary)
         }
     }
 }

@@ -4,23 +4,23 @@ struct RegexClueLabel: View {
     let pattern: String
     let state: ClueState
     let isActive: Bool
-    var fontSize: CGFloat = 14
+    var fontSize: CGFloat = 13
 
     var body: some View {
         Text(pattern)
             .font(.custom("JetBrainsMono-Regular", size: fontSize)
                 .weight(isActive ? .bold : .regular))
             .foregroundColor(textColor)
-            .underline(isActive)
+            .underline(isActive, color: .hexActiveBorder)
             .lineLimit(1)
             .fixedSize()
     }
 
-    var textColor: Color {
+    private var textColor: Color {
         switch state {
         case .incomplete: return Color(.secondaryLabel)
         case .correct:    return .hexCorrect
-        case .incorrect:  return .hexIncorrect
+        case .incorrect:  return .hexIncorrect  
         }
     }
 }

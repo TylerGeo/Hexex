@@ -6,19 +6,40 @@ import SwiftData
 @Observable
 final class GameViewModel {
 
-    // MARK: - Grid State
+    // MARK: - Game identity
 
-    var cells: [[CellState]]
-    var selectedCell: GridIndex?
-    var checkOverlay: [GridIndex: Bool] = [:]
+    let difficulty: Difficulty
 
-    // MARK: - Clue States
+    // MARK: - Loading
 
-    var horizontalStates: [ClueState] = Array(repeating: .incomplete, count: 5)
-    var diagRightStates: [ClueState]  = Array(repeating: .incomplete, count: 5)
-    var diagLeftStates: [ClueState]   = Array(repeating: .incomplete, count: 5)
+    enum LoadingPhase: Equatable {
+        case generating
+        case ready
+    }
+    var loadingPhase: LoadingPhase = .generating
 
-    // MARK: - Game Progress
+    // MARK: - Puzzle (set after generation/load)
+
+    private(set) var puzzle: Puzzle?
+    private(set) var board: HexBoard?
+    private(set) var traversal: TraversalEngine?
+
+    // MARK: - Cell state
+
+    var cells: [Hex: CellState] = [:]
+    var selectedCell: Hex?
+    var checkOverlay: [Hex: Bool] = [:]
+
+    // MARK: - Clue state
+
+    /// Keyed by `RegexClue.id`. Defaults to `.incomplete`.
+    var clueStates: [String: ClueState] = [:]
+
+    func clueState(for clue: RegexClue) -> ClueState {
+        clueStates[clue.id] ?? .incomplete
+    }
+
+    // MARK: - Progress
 
     var elapsedSeconds: Double = 0
     var checksUsed: Int = 0
@@ -26,42 +47,78 @@ final class GameViewModel {
     var isComplete: Bool = false
     var showResults: Bool = false
 
-    // MARK: - Owned Objects
+    // MARK: - Owned services
 
-    let puzzle: Puzzle
-    let puzzleNumber: Int
-    let traversal: TraversalEngine
-    let evaluator: RegexEvaluator
-
-    // MARK: - Timer
-
+    let evaluator = RegexEvaluator()
     private var timer: Timer?
 
     // MARK: - Init
 
-    init(puzzle: Puzzle, puzzleNumber: Int) {
-        self.puzzle = puzzle
-        self.puzzleNumber = puzzleNumber
-        self.traversal = TraversalEngine()
-        self.evaluator = RegexEvaluator()
+    init(difficulty: Difficulty) {
+        self.difficulty = difficulty
+    }
 
-        // Build jagged cell grid from row sizes
-        self.cells = HexGrid.rowSizes.map { count in
-            Array(repeating: CellState.empty, count: count)
+    // MARK: - Boot
+
+    /// Load any saved state for this difficulty slot, otherwise generate a
+    /// fresh puzzle (off the main actor). Idempotent.
+    func start(context: ModelContext) async {
+        guard loadingPhase == .generating else { return }
+
+        if let record = fetchRecord(context: context),
+           !record.isComplete,
+           let savedPuzzle = GameRecord.decodePuzzle(record.puzzleData),
+           savedPuzzle.difficulty == difficulty {
+            let savedCells = GameRecord.decodeCells(record.cellData) ?? [:]
+            adopt(puzzle: savedPuzzle, savedCells: savedCells, savedRecord: record)
+        } else {
+            let fresh = await PuzzleGenerator.generate(difficulty: difficulty)
+            adopt(puzzle: fresh, savedCells: nil, savedRecord: nil)
+            // Replace any stale completed/abandoned record with the fresh puzzle.
+            persist(context: context, force: true)
         }
+
+        loadingPhase = .ready
+    }
+
+    private func adopt(puzzle: Puzzle, savedCells: [Hex: CellState]?, savedRecord: GameRecord?) {
+        let board = HexBoard(sideLength: puzzle.sideLength)
+        self.puzzle = puzzle
+        self.board = board
+
+        let traversal = TraversalEngine(board: board)
+        traversal.setLine(axis: .horizontal, key: -(puzzle.sideLength - 1))
+        self.traversal = traversal
+
+        var initial: [Hex: CellState] = [:]
+        initial.reserveCapacity(board.hexes.count)
+        for h in board.hexes {
+            initial[h] = savedCells?[h] ?? .empty
+        }
+        self.cells = initial
+
+        if let r = savedRecord {
+            self.checksUsed = r.checksUsed
+            self.revealsUsed = r.revealsUsed
+            self.elapsedSeconds = r.elapsedSeconds
+        }
+
+        validateAll()
+        checkCompletion(silent: true)
     }
 
     // MARK: - Timer
 
     func startTimer() {
-        guard timer == nil, !isComplete else { return }
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        guard timer == nil, !isComplete, loadingPhase == .ready else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, !self.isComplete else { return }
                 self.elapsedSeconds += 1
             }
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        RunLoop.main.add(t, forMode: .common)
+        self.timer = t
     }
 
     func stopTimer() {
@@ -69,98 +126,73 @@ final class GameViewModel {
         timer = nil
     }
 
-    // MARK: - Cell Selection
+    // MARK: - Selection
 
-    func selectCell(_ index: GridIndex) {
-        selectedCell = index
-        checkOverlay.removeAll()
+    func selectCell(_ hex: Hex) {
+        if selectedCell == hex {
+            traversal?.cycleAxis(for: hex)
+        } else {
+            selectedCell = hex
+            checkOverlay.removeAll()
+            traversal?.selectCell(hex)
+        }
+    }
 
-        // Pick the best axis for this cell:
-        // keep current axis if cell is on it, otherwise prefer horizontal
-        let memberships = traversal.allLineIndices(for: index)
-        let alreadyOnActive = memberships.contains {
-            $0.axis == traversal.activeAxis && $0.lineIndex == traversal.activeLineIndex
-        }
-        if !alreadyOnActive, let first = memberships.first {
-            traversal.setAxis(first.axis, lineIndex: first.lineIndex)
-        }
+    func selectClue(axis: TraversalAxis, lineKey: Int) {
+        guard let board, let traversal else { return }
+        traversal.setLine(axis: axis, key: lineKey)
+        let line = board.line(axis: axis, key: lineKey)
+        if let s = selectedCell, line.contains(s) { return }
+        selectedCell = line.first
     }
 
     // MARK: - Input
 
     func inputCharacter(_ char: Character) {
-        guard let idx = selectedCell else { return }
-        // Don't overwrite revealed cells
-        if case .revealed = cells[idx.row][idx.col] { return }
+        guard let hex = selectedCell else { return }
+        if case .revealed = cells[hex] ?? .empty { return }
 
-        cells[idx.row][idx.col] = .filled(char)
-        checkOverlay[idx] = nil
+        cells[hex] = .filled(char)
+        checkOverlay[hex] = nil
         HapticManager.shared.keyPress()
 
-        validateAll()
+        revalidate(touching: hex)
         checkCompletion()
 
-        // Advance to next cell in traversal
-        if let next = traversal.nextCell(from: idx) {
+        if let next = traversal?.nextCell(from: hex) {
             selectedCell = next
         }
     }
 
     func deleteCharacter() {
-        guard let idx = selectedCell else { return }
-        // Only delete .filled cells; leave .revealed intact
-        if case .filled = cells[idx.row][idx.col] {
-            cells[idx.row][idx.col] = .empty
+        guard let hex = selectedCell else { return }
+        if case .filled = cells[hex] ?? .empty {
+            cells[hex] = .empty
         }
-        checkOverlay[idx] = nil
-        validateAll()
+        checkOverlay[hex] = nil
+        revalidate(touching: hex)
     }
 
-    // MARK: - Clue Selection
-
-    func selectClue(axis: TraversalAxis, lineIndex: Int) {
-        traversal.setAxis(axis, lineIndex: lineIndex)
-
-        // If selected cell is not on this line, jump to first cell of the line
-        let line: [GridIndex]
-        switch axis {
-        case .horizontal: line = HexGrid.horizontalLines[lineIndex]
-        case .diagRight:  line = HexGrid.diagRightLines[lineIndex]
-        case .diagLeft:   line = HexGrid.diagLeftLines[lineIndex]
-        }
-
-        let cellOnLine = selectedCell.map { line.contains($0) } ?? false
-        if !cellOnLine, let first = line.first {
-            selectedCell = first
-        }
-    }
-
-    // MARK: - Check
+    // MARK: - Check / reveal
 
     func checkCurrentState() {
+        guard let puzzle else { return }
         checksUsed += 1
 
         var anyCorrect = false
         var anyIncorrect = false
-
-        for row in 0..<cells.count {
-            for col in 0..<cells[row].count {
-                let idx = GridIndex(row: row, col: col)
-                let state = cells[row][col]
-                switch state {
-                case .empty:
-                    break
-                case .revealed:
-                    checkOverlay[idx] = true
-                    anyCorrect = true
-                case .filled(let ch):
-                    let solRow = puzzle.solution[row]
-                    guard col < solRow.count else { continue }
-                    let solChar = solRow[col]
-                    let correct = String(ch).uppercased() == solChar.uppercased()
-                    checkOverlay[idx] = correct
-                    if correct { anyCorrect = true } else { anyIncorrect = true }
-                }
+        for (hex, state) in cells {
+            switch state {
+            case .empty:
+                break
+            case .revealed:
+                checkOverlay[hex] = true
+                anyCorrect = true
+            case .filled(let c):
+                guard let truth = puzzle.solution[hex] else { continue }
+                let ok = String(c).uppercased() == String(truth).uppercased()
+                checkOverlay[hex] = ok
+                if ok { anyCorrect = true } else { anyIncorrect = true }
             }
         }
 
@@ -171,103 +203,101 @@ final class GameViewModel {
         }
     }
 
-    // MARK: - Reveal
-
     func revealOneCell() {
+        guard let puzzle, let board else { return }
         revealsUsed += 1
 
-        // Scan rows left-to-right for first empty cell
-        outer: for row in 0..<cells.count {
-            for col in 0..<cells[row].count {
-                if case .empty = cells[row][col] {
-                    let solRow = puzzle.solution[row]
-                    guard col < solRow.count, !solRow[col].isEmpty else { continue }
-                    let solChar = Character(solRow[col].uppercased())
-                    cells[row][col] = .revealed(solChar)
-                    HapticManager.shared.keyPress()
-                    validateAll()
-                    checkCompletion()
-                    break outer
-                }
+        for hex in board.hexes {
+            if case .empty = cells[hex] ?? .empty,
+               let truth = puzzle.solution[hex] {
+                cells[hex] = .revealed(truth)
+                HapticManager.shared.keyPress()
+                revalidate(touching: hex)
+                checkCompletion()
+                return
             }
         }
     }
 
     // MARK: - Validation
 
+    private func revalidate(touching hex: Hex) {
+        for (axis, key) in [
+            (TraversalAxis.horizontal, hex.r),
+            (TraversalAxis.diagRight,  hex.q),
+            (TraversalAxis.diagLeft,   hex.s)
+        ] {
+            validateLine(axis: axis, key: key)
+        }
+    }
+
     private func validateAll() {
-        // Horizontal lines — left to right
-        for i in 0..<5 {
-            let lineCells = HexGrid.horizontalLines[i].map { cells[$0.row][$0.col] }
-            horizontalStates[i] = evaluator.evaluateLine(
-                pattern: puzzle.horizontal[i],
-                cells: lineCells
-            )
+        guard let puzzle else { return }
+        for clue in puzzle.clues {
+            validateLine(axis: clue.axis, key: clue.lineKey)
         }
+    }
 
-        // DiagRight lines — top-left to bottom-right
-        for i in 0..<5 {
-            let lineCells = HexGrid.diagRightLines[i].map { cells[$0.row][$0.col] }
-            diagRightStates[i] = evaluator.evaluateLine(
-                pattern: puzzle.diagRight[i],
-                cells: lineCells
-            )
-        }
-
-        // DiagLeft lines — stored bottom→top, so lineString matches pattern directly
-        for i in 0..<5 {
-            let lineCells = HexGrid.diagLeftLines[i].map { cells[$0.row][$0.col] }
-            diagLeftStates[i] = evaluator.evaluateLine(
-                pattern: puzzle.diagLeft[i],
-                cells: lineCells
-            )
-        }
+    private func validateLine(axis: TraversalAxis, key: Int) {
+        guard let puzzle, let board,
+              let clue = puzzle.clue(axis: axis, lineKey: key) else { return }
+        let line = board.line(axis: axis, key: key)
+        let lineCells = line.map { cells[$0] ?? .empty }
+        clueStates[clue.id] = evaluator.evaluateLine(pattern: clue.pattern, cells: lineCells)
     }
 
     // MARK: - Completion
 
-    private func checkCompletion() {
-        let allCorrect =
-            horizontalStates.allSatisfy { $0 == .correct } &&
-            diagRightStates.allSatisfy  { $0 == .correct } &&
-            diagLeftStates.allSatisfy   { $0 == .correct }
-
-        guard allCorrect, !isComplete else { return }
+    private func checkCompletion(silent: Bool = false) {
+        guard let puzzle, !isComplete else { return }
+        let allCorrect = puzzle.clues.allSatisfy { clueStates[$0.id] == .correct }
+        guard allCorrect else { return }
 
         isComplete = true
         stopTimer()
-        HapticManager.shared.solved()
+        if silent { return }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+        HapticManager.shared.solved()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
             self?.showResults = true
         }
     }
 
     // MARK: - Persistence
 
-    func saveProgress(context: ModelContext) {
-        // Fetch existing record or create new one
-        let puzzleID = puzzle.id
+    private func fetchRecord(context: ModelContext) -> GameRecord? {
+        let key = difficulty.rawValue
         let descriptor = FetchDescriptor<GameRecord>(
-            predicate: #Predicate { $0.puzzleID == puzzleID }
+            predicate: #Predicate { $0.slotKey == key }
         )
-        let existing = try? context.fetch(descriptor)
+        return (try? context.fetch(descriptor))?.first
+    }
 
+    func saveProgress(context: ModelContext) {
+        persist(context: context, force: false)
+    }
+
+    private func persist(context: ModelContext, force: Bool) {
+        guard let puzzle else { return }
         let record: GameRecord
-        if let found = existing?.first {
-            record = found
+        if let existing = fetchRecord(context: context) {
+            record = existing
+            if force {
+                record.startTime = Date()
+                record.completionDate = nil
+            }
         } else {
-            record = GameRecord()
-            record.puzzleID = puzzleID
-            record.startTime = Date()
+            record = GameRecord(slotKey: difficulty.rawValue, startTime: Date())
             context.insert(record)
         }
 
-        record.cellData        = GameRecord.encode(cells: cells)
-        record.checksUsed      = checksUsed
-        record.revealsUsed     = revealsUsed
-        record.elapsedSeconds  = elapsedSeconds
-        record.isComplete      = isComplete
+        record.puzzleData     = GameRecord.encode(puzzle: puzzle)
+        record.cellData       = GameRecord.encode(cells: cells)
+        record.checksUsed     = checksUsed
+        record.revealsUsed    = revealsUsed
+        record.elapsedSeconds = elapsedSeconds
+        record.isComplete     = isComplete
         if isComplete {
             record.completionDate = record.completionDate ?? Date()
         }
@@ -275,20 +305,31 @@ final class GameViewModel {
         try? context.save()
     }
 
-    func loadProgress(from record: GameRecord) {
-        if let decoded = GameRecord.decode(data: record.cellData) {
-            // Validate dimensions match before restoring
-            let valid = decoded.count == cells.count &&
-                zip(decoded, cells).allSatisfy { $0.count == $1.count }
-            if valid {
-                cells = decoded
-            }
-        }
-        checksUsed     = record.checksUsed
-        revealsUsed    = record.revealsUsed
-        elapsedSeconds = record.elapsedSeconds
-        isComplete     = record.isComplete
+    // MARK: - Reset
 
-        validateAll()
+    /// Discard the current saved record and generate a fresh puzzle.
+    func newPuzzle(context: ModelContext) async {
+        stopTimer()
+        if let existing = fetchRecord(context: context) {
+            context.delete(existing)
+            try? context.save()
+        }
+
+        loadingPhase = .generating
+        puzzle = nil
+        board = nil
+        traversal = nil
+        cells.removeAll()
+        clueStates.removeAll()
+        checkOverlay.removeAll()
+        selectedCell = nil
+        checksUsed = 0
+        revealsUsed = 0
+        elapsedSeconds = 0
+        isComplete = false
+        showResults = false
+
+        await start(context: context)
+        startTimer()
     }
 }

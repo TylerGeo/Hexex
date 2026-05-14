@@ -4,16 +4,19 @@ struct GameStatusBar: View {
     @Environment(GameViewModel.self) var vm
 
     var body: some View {
-        HStack(spacing: 16) {
-            // Timer display
-            Text(timeString)
-                .font(.system(size: 16, weight: .medium, design: .monospaced))
-                .foregroundColor(.primary)
-                .frame(minWidth: 52, alignment: .leading)
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(vm.difficulty.displayName)
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .foregroundColor(.primary)
+                Text(timeString)
+                    .font(.system(size: 14, weight: .regular, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .frame(minWidth: 52, alignment: .leading)
+            }
 
             Spacer()
 
-            // Check button
             Button {
                 vm.checkCurrentState()
             } label: {
@@ -28,8 +31,8 @@ struct GameStatusBar: View {
             }
             .buttonStyle(.plain)
             .foregroundColor(.secondary)
+            .disabled(vm.loadingPhase != .ready)
 
-            // Reveal button
             Button {
                 vm.revealOneCell()
             } label: {
@@ -44,6 +47,7 @@ struct GameStatusBar: View {
             }
             .buttonStyle(.plain)
             .foregroundColor(.secondary)
+            .disabled(vm.loadingPhase != .ready)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)

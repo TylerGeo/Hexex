@@ -4,10 +4,11 @@ struct RegexClueLabel: View {
     let pattern: String
     let state: ClueState
     let isActive: Bool
+    var fontSize: CGFloat = 14
 
     var body: some View {
         Text(pattern)
-            .font(.custom("JetBrainsMono-Regular", size: 14)
+            .font(.custom("JetBrainsMono-Regular", size: fontSize)
                 .weight(isActive ? .bold : .regular))
             .foregroundColor(textColor)
             .underline(isActive)
